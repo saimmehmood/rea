@@ -61,6 +61,17 @@ export const authorizedElectronFile = async (
 export const retryElectronFileCleanup = async (): Promise<void> =>
   await resources.retryCleanup();
 
+/**
+ * Keep the producer's own facts and add the caller's, without replacing the
+ * typed error. The caller supplies the completed prefix, so it has to survive
+ * every branch below, not only a cancellation.
+ */
+const withCallerDiagnostics = <Failure extends AnalysisError>(
+  error: Failure,
+  diagnostics: Readonly<Record<string, JsonValue>> | undefined,
+): Failure =>
+  diagnostics === undefined ? error : error.retainDiagnostics(diagnostics);
+
 /** Translate a retained ASAR descriptor failure at its provider boundary. */
 export const mapElectronFileAuthorizationFailure = (
   cause: unknown,
@@ -95,11 +106,12 @@ export const mapElectronFileAuthorizationFailure = (
         ...(diagnostics === undefined ? {} : { diagnostics }),
       })
     : physicalPrimary instanceof AnalysisError
-      ? physicalPrimary
+      ? withCallerDiagnostics(physicalPrimary, diagnostics)
       : physicalPrimary === undefined
         ? undefined
         : new ProviderAdapterError(providerId, operation, {
             cause: physicalPrimary,
+            ...(diagnostics === undefined ? {} : { diagnostics }),
           });
   const cleanup = new ProviderCleanupError(
     providerId,
@@ -108,7 +120,9 @@ export const mapElectronFileAuthorizationFailure = (
     { operation, cause },
   );
   bindArtifactFileCleanup(cause, cleanup);
-  if (primary === undefined) return cleanup;
+  // With no primary failure the cleanup error is the caller's only result, so
+  // the completed prefix has to survive on it.
+  if (primary === undefined) return withCallerDiagnostics(cleanup, diagnostics);
   const composed = analysisErrorWithCleanupFailure(primary, cleanup, operation);
   bindArtifactFileCleanup(cause, composed);
   return composed;

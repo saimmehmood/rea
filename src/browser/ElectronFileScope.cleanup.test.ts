@@ -70,6 +70,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
+import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import { CdpElectronProvider } from "./CdpElectronProvider.js";
 import {
   authorizedElectronFile,
@@ -294,4 +295,129 @@ it("retries a failed ASAR descriptor lease during provider shutdown", async () =
   await new CdpElectronProvider().close();
 
   expect(handleState.events).toEqual(["open", "close", "close"]);
+});
+
+/** The completed target inventory CdpElectronProvider supplies to the mapper. */
+const COMPLETED_PREFIX = {
+  browser_version: "Electron/38.0.0",
+  examined_targets: 2,
+  discovered_targets: 3,
+  allowed_targets: [{ target_id: "page-1" }],
+  excluded: { unsupported_url: 1, non_page: 0 },
+  unconnectable_targets: 0,
+  coverage:
+    "partial: target authorization stopped; remaining targets are unknown",
+};
+
+it("retains the caller's completed prefix when only ASAR cleanup failed", async () => {
+  const location = await asarPage();
+  const missing = pathToFileURL(
+    join(dirname(fileURLToPath(location)), "missing.js"),
+  ).href;
+  handleState.failCloseCount = 1;
+
+  let failure: unknown;
+  try {
+    await authorizedElectronFile(missing, undefined, "list_electron_targets");
+  } catch (cause: unknown) {
+    failure = cause;
+  }
+  const mapped = mapElectronFileAuthorizationFailure(
+    failure,
+    "rea-cdp-electron",
+    "list_electron_targets",
+    { completed_prefix: COMPLETED_PREFIX },
+  );
+  if (mapped === undefined)
+    throw new Error("Expected a mapped ASAR cleanup failure");
+  // The cleanup error is the caller's only result, so it carries the prefix.
+  expect(mapped.cleanupPrimary).toBeUndefined();
+  expect(mapped.diagnostics).toMatchObject({
+    reason: expect.any(String),
+    completed_prefix: COMPLETED_PREFIX,
+  });
+  expect(projectAnalysisError(mapped).details).toMatchObject({
+    diagnostics: { completed_prefix: COMPLETED_PREFIX },
+  });
+
+  await expect(
+    authorizedElectronFile(missing, undefined, "list_electron_targets"),
+  ).resolves.toBeUndefined();
+  expect(mapped.cleanupIncomplete).toBe(false);
+});
+
+it("retains the caller's completed prefix when an ASAR read failure stays primary", async () => {
+  const location = await asarPage();
+  const readFailure = new Error("controlled ASAR header read failure");
+  handleState.failCloseCount = 1;
+  handleState.readFailure = readFailure;
+
+  let failure: unknown;
+  try {
+    await authorizedElectronFile(location, undefined, "list_electron_targets");
+  } catch (cause: unknown) {
+    failure = cause;
+  }
+  const mapped = mapElectronFileAuthorizationFailure(
+    failure,
+    "rea-cdp-electron",
+    "list_electron_targets",
+    { completed_prefix: COMPLETED_PREFIX },
+  );
+  if (mapped === undefined)
+    throw new Error("Expected a mapped ASAR cleanup failure");
+  expect(mapped.cleanupPrimary?.cause).toBe(readFailure);
+  expect(mapped.cleanupPrimary?.diagnostics).toMatchObject({
+    completed_prefix: COMPLETED_PREFIX,
+  });
+  // The prefix stays reachable through typed projection.
+  expect(projectAnalysisError(mapped).details).toMatchObject({
+    diagnostics: {
+      primary_error: {
+        details: { diagnostics: { completed_prefix: COMPLETED_PREFIX } },
+      },
+    },
+  });
+
+  await expect(authorizedElectronFile(location)).resolves.toBe(
+    `${handleState.archive}/index.html`,
+  );
+  expect(mapped.cleanupIncomplete).toBe(false);
+});
+
+it("retains the caller's completed prefix alongside a cancellation primary", async () => {
+  const location = await asarPage();
+  const controller = new AbortController();
+  const reason = new Error("cancel during ASAR close");
+  handleState.closeController = controller;
+  handleState.closeReason = reason;
+  handleState.failCloseCount = 1;
+
+  let failure: unknown;
+  try {
+    await authorizedElectronFile(
+      location,
+      controller.signal,
+      "list_electron_targets",
+    );
+  } catch (cause: unknown) {
+    failure = cause;
+  }
+  const mapped = mapElectronFileAuthorizationFailure(
+    failure,
+    "rea-cdp-electron",
+    "list_electron_targets",
+    { completed_prefix: COMPLETED_PREFIX },
+  );
+  if (mapped === undefined)
+    throw new Error("Expected a mapped ASAR cleanup failure");
+  expect(mapped.cleanupPrimary).toBeInstanceOf(AnalysisCancelledError);
+  expect(mapped.cleanupPrimary?.diagnostics).toMatchObject({
+    completed_prefix: COMPLETED_PREFIX,
+  });
+
+  await expect(authorizedElectronFile(location)).resolves.toBe(
+    `${handleState.archive}/index.html`,
+  );
+  expect(mapped.cleanupIncomplete).toBe(false);
 });
