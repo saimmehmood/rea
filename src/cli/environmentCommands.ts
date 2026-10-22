@@ -117,6 +117,48 @@ interface ServeInputs {
 const cancelledServe = (): JsonValue =>
   cliError(new AnalysisCancelledError(CLI_COMMANDS.environmentServe));
 
+/**
+ * A rejected final shutdown as the command's typed refusal. The served endpoint
+ * stays the named remaining resource, and the listener failure or the completed
+ * stop facts are retained beside it, so unverified release never replaces the
+ * result the caller came for.
+ *
+ * Built from the error algebra this command already loads: registering the
+ * command catalog must not widen the CLI's startup import graph.
+ */
+const serveShutdownRefusal = (
+  endpoint: McpHttpEndpoint,
+  url: string,
+  cause: unknown,
+  primary: AnalysisResourceConstraintError | undefined,
+  completed: JsonValue | undefined,
+): AnalysisError => {
+  const reason = cause instanceof Error ? cause.message : String(cause);
+  return new AnalysisResourceConstraintError(
+    CLI_COMMANDS.environmentServe,
+    "transport",
+    primary === undefined
+      ? `Served environment shutdown could not be confirmed: ${reason}`
+      : primary.message,
+    { host: endpoint.host, port: endpoint.port },
+    {
+      cause,
+      // The typed primary survives projection beside the cleanup observation.
+      ...(primary === undefined ? {} : { cleanupPrimary: primary }),
+      cleanup: { reason, resources: [url] },
+      diagnostics: {
+        shutdown_error: reason,
+        ...(primary === undefined
+          ? {}
+          : { primary_error: projectAnalysisError(primary) }),
+        ...(completed === undefined ? {} : { completed_result: completed }),
+      },
+      remediationAction:
+        "The served endpoint could not be proven closed. Check for a process still bound to the reported URL before serving this environment again.",
+    },
+  );
+};
+
 /** Pure replay, as `--replay-only` asks for: no state is derived. */
 const REPLAY_ONLY: ServedState = {
   state: undefined,
@@ -216,14 +258,18 @@ const serveEnvironmentCommand = async (
     return cliError(transportError(endpoint.value, cause));
   }
   let failure: StreamableHttpListenError | undefined;
+  let shutdown: { readonly cause: unknown } | undefined;
   try {
     failure = await Promise.race([untilAborted(signal), listenerFailed]);
   } finally {
-    await served.close();
+    // An unproven shutdown is reported beside the listener failure or the stop
+    // facts, never in place of them.
+    shutdown = await served.close().then(
+      () => undefined,
+      (cause: unknown) => ({ cause }),
+    );
   }
-  if (failure !== undefined)
-    return cliError(transportError(endpoint.value, failure));
-  return {
+  const stopped: JsonValue = {
     status: "stopped",
     url: served.url,
     environment: served.card.name,
@@ -232,6 +278,31 @@ const serveEnvironmentCommand = async (
     manifest_evidence_id: source.manifestEvidenceId,
     state: report,
   };
+  if (failure !== undefined) {
+    const primary = transportError(endpoint.value, failure);
+    return cliError(
+      shutdown === undefined
+        ? primary
+        : serveShutdownRefusal(
+            endpoint.value,
+            served.url,
+            shutdown.cause,
+            primary,
+            undefined,
+          ),
+    );
+  }
+  if (shutdown !== undefined)
+    return cliError(
+      serveShutdownRefusal(
+        endpoint.value,
+        served.url,
+        shutdown.cause,
+        undefined,
+        stopped,
+      ),
+    );
+  return stopped;
 };
 
 interface ExportArguments {
